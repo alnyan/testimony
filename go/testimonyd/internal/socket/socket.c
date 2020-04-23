@@ -23,6 +23,7 @@
 #include <sys/mman.h>         // mmap(), PROT_*, MAP_*
 #include <unistd.h>           // close()
 #include <linux/filter.h>     // sock_fprog, sock_filter
+#include <stdio.h>
 
 #ifndef UNIX_PATH_MAX
 #define UNIX_PATH_MAX 108

@@ -51,6 +51,7 @@ type SocketConfig struct {
 	FanoutID           int    // fanout id to avoid conflicts
 	User, Group        string // user/group to provide the socket to (will chown it)
 	Filter             string // BPF filter to apply to this socket
+    SubsocketCount     int
 }
 
 func (s SocketConfig) uid() (int, error) {
@@ -137,20 +138,42 @@ func RunTestimony(t Testimony) {
 		// goroutine to manage its connections.
 		_ignore_error_ := os.Remove(sc.SocketName)
 		_ = _ignore_error_
-		list, err := net.ListenUnix("unix", &net.UnixAddr{Net: "unix", Name: sc.SocketName})
-		if err != nil {
-			log.Fatalf("failed to listen on socket: %v", err)
-		} else if err := setPermissions(sc); err != nil {
-			log.Fatalf("failed to set socket permissions: %v", err)
-		}
-		go t.run(list, sc, socks)
+
+        list, err := net.ListenUnix("unix", &net.UnixAddr{Net: "unix", Name: sc.SocketName})
+        if err != nil {
+            log.Fatalf("failed to listen on socket: %v", err)
+        } else if err := setPermissions(sc.SocketName, sc); err != nil {
+            log.Fatalf("failed to set socket permissions: %v", err)
+        }
+        if sc.SubsocketCount > 1 {
+            for i := 0; i < sc.SubsocketCount; i++ {
+                path := sc.SocketName + "." + strconv.Itoa(i)
+                _ignore_error_ := os.Remove(path)
+                _ = _ignore_error_
+
+                lbList, err := net.ListenUnix("unix", &net.UnixAddr{
+                    Net: "unix",
+                    Name: path,
+                })
+
+                if err != nil {
+                    log.Fatalf("invalid config %+v: %v", sc, err)
+                } else if err := setPermissions(path, sc); err != nil {
+                    log.Fatalf("Failed to set socket permissions: %v", err)
+                }
+
+                go t.run(lbList, sc, socks, i)
+            }
+        }
+
+        go t.run(list, sc, socks, -1)
 	}
 	// We'd love to drop privs here, but thanks to
 	// https://github.com/golang/go/issues/1435 we can't :(
 	select {} // Block (serving) forever.
 }
 
-func setPermissions(sc SocketConfig) error {
+func setPermissions(name string, sc SocketConfig) error {
 	uid, err := sc.uid()
 	if err != nil {
 		return fmt.Errorf("could not get uid to change to: %v", err)
@@ -159,31 +182,31 @@ func setPermissions(sc SocketConfig) error {
 	if err != nil {
 		return fmt.Errorf("could not get gid to change to: %v", err)
 	}
-	vlog.V(1, "chowning %q to %d/%d", sc.SocketName, uid, gid)
-	if err := syscall.Chown(sc.SocketName, uid, gid); err != nil {
+	vlog.V(1, "chowning %q to %d/%d", name, uid, gid)
+	if err := syscall.Chown(name, uid, gid); err != nil {
 		return fmt.Errorf("unable to chown to (%d, 0): %v", uid, err)
 	}
 	return nil
 }
 
-func (t Testimony) run(list *net.UnixListener, sc SocketConfig, socks []*socket) {
+func (t Testimony) run(list *net.UnixListener, sc SocketConfig, socks []*socket, lbIndex int) {
 	for {
 		c, err := list.AcceptUnix()
 		if err != nil {
 			log.Fatalf("failed to accept connection: %v", err)
 		}
-		go t.handle(socks, c)
+		go t.handle(socks, c, sc, lbIndex)
 	}
 }
 
-func (t Testimony) handle(socks []*socket, c *net.UnixConn) {
+func (t Testimony) handle(socks []*socket, c *net.UnixConn, sc SocketConfig, lbIndex int) {
 	defer func() {
 		if c != nil {
 			c.Close()
 		}
 	}()
 	connStr := c.RemoteAddr().String()
-	log.Printf("Received new connection %q", connStr)
+	log.Printf("Received new connection %q, lb index %d", connStr, lbIndex)
 	var version [1]byte
 	version[0] = protocolVersion
 	if _, err := c.Write(version[:]); err != nil {
@@ -235,6 +258,6 @@ func (t Testimony) handle(socks []*socket, c *net.UnixConn) {
 		return
 	}
 	vlog.V(2, "new conn %q spun up, passing off to socket", connStr)
-	sock.newConns <- c
+	sock.newConns <- IncomingConnection{c, lbIndex}
 	c = nil // so it doesn't get closed by deferred func.
 }

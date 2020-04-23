@@ -49,6 +49,11 @@ import (
 	"github.com/google/testimony/go/testimonyd/internal/vlog"
 )
 
+type IncomingConnection struct {
+    unixConn *net.UnixConn
+    lbIndex int
+}
+
 // socket handles a single AF_PACKET socket.  There will be N Socket objects for
 // each SocketConfig, where N == FanoutSize.  This Socket stores the file
 // descriptor and memory region of a single underlying AF_PACKET socket.
@@ -56,12 +61,14 @@ type socket struct {
 	num          int                // fanout index for this socket
 	conf         SocketConfig       // configuration
 	fd           int                // file descriptor for AF_PACKET socket
-	newConns     chan *net.UnixConn // new client connections come in here
+    newConns     chan IncomingConnection
+	//newConns     chan *net.UnixConn // new client connections come in here
 	oldConns     chan *conn         // old client connections come in here for cleanup
 	newBlocks    chan *block        // when a new block is available, it comes in here
 	blocks       []*block           // all blocks in the memory region
 	currentConns map[*conn]bool     // list of current connections a new block will be sent to
 	ring         uintptr            // pointer to memory region
+    lbCounter    int
 }
 
 // newSocket creates a new Socket object based on a config.
@@ -69,11 +76,13 @@ func newSocket(sc SocketConfig, fanoutID int, num int) (*socket, error) {
 	s := &socket{
 		num:          num,
 		conf:         sc,
-		newConns:     make(chan *net.UnixConn),
+        newConns:     make(chan IncomingConnection),
+	//	newConns:     make(chan *net.UnixConn),
 		oldConns:     make(chan *conn),
 		newBlocks:    make(chan *block, sc.NumBlocks),
 		currentConns: map[*conn]bool{},
 		blocks:       make([]*block, sc.NumBlocks),
+        lbCounter:    0,
 	}
 
 	// Compile the BPF filter, if it was requested.
@@ -125,12 +134,13 @@ func (s *socket) getNewBlocks() {
 		b := s.blocks[blockIndex]
 		for !b.ready() {
 			time.Sleep(sleep)
-			if sleep < time.Second/4 {
-				sleep *= 2
-			}
+			//if sleep < time.Second/4 {
+			//	sleep *= 2
+			//}
 		}
 		b.ref()
 		vlog.V(3, "%v got new block %v", s, b)
+        // TODO: maybe split the block based on flow?
 		s.newBlocks <- b
 		blockIndex = (blockIndex + 1) % s.conf.NumBlocks
 	}
@@ -157,6 +167,18 @@ func (s *socket) reportStats() {
 	}
 }
 
+func (s *socket) balance(index int) bool {
+    if index == -1 {
+        return true
+    }
+
+    if s.conf.SubsocketCount > 1 {
+        return s.lbCounter == index
+    } else {
+        return false
+    }
+}
+
 // run handles new connections, old connections, new blocks... basically
 // everything.
 func (s *socket) run() {
@@ -173,14 +195,20 @@ func (s *socket) run() {
 			delete(s.currentConns, c)
 		case b := <-s.newBlocks:
 			// a new block is avaiable, send it out to all clients
+            // TODO Vadym's LB here
+            if s.conf.SubsocketCount > 1 {
+                s.lbCounter = (s.lbCounter + 1) % s.conf.SubsocketCount
+            }
 			for c, _ := range s.currentConns {
-				b.ref()
-				select {
-				case c.newBlocks <- b:
-				default:
-					vlog.V(1, "failed to send %v to %v", b, c)
-					b.unref()
-				}
+                if s.balance(c.lbIndex) {
+                    b.ref()
+                    select {
+                    case c.newBlocks <- b:
+                    default:
+                        vlog.V(1, "failed to send %v to %v", b, c)
+                        b.unref()
+                    }
+                }
 			}
 			b.unref()
 		}
@@ -192,6 +220,7 @@ func (s *socket) run() {
 type conn struct {
 	s         *socket
 	c         *net.UnixConn
+    lbIndex   int
 	newBlocks chan *block
 	oldBlocks chan int
 }
@@ -330,10 +359,11 @@ loop:
 // addNewConn is called by the testimonyd server when a new connection has been
 // initiated.  The passed-in conn should already have done the initial
 // configuration handshake, and be ready to start receiving blocks.
-func (s *socket) addNewConn(c *net.UnixConn) {
+func (s *socket) addNewConn(c IncomingConnection) {
 	newConn := &conn{
 		s:         s,
-		c:         c,
+		c:         c.unixConn,
+        lbIndex:   c.lbIndex,
 		newBlocks: make(chan *block, len(s.blocks)),
 		oldBlocks: make(chan int, len(s.blocks)),
 	}
