@@ -54,6 +54,11 @@ type IncomingConnection struct {
     lbIndex int
 }
 
+type PacketRef struct {
+    b *block
+    off uint32
+}
+
 // socket handles a single AF_PACKET socket.  There will be N Socket objects for
 // each SocketConfig, where N == FanoutSize.  This Socket stores the file
 // descriptor and memory region of a single underlying AF_PACKET socket.
@@ -62,7 +67,6 @@ type socket struct {
 	conf         SocketConfig       // configuration
 	fd           int                // file descriptor for AF_PACKET socket
     newConns     chan IncomingConnection
-	//newConns     chan *net.UnixConn // new client connections come in here
 	oldConns     chan *conn         // old client connections come in here for cleanup
 	newBlocks    chan *block        // when a new block is available, it comes in here
 	blocks       []*block           // all blocks in the memory region
@@ -77,7 +81,6 @@ func newSocket(sc SocketConfig, fanoutID int, num int) (*socket, error) {
 		num:          num,
 		conf:         sc,
         newConns:     make(chan IncomingConnection),
-	//	newConns:     make(chan *net.UnixConn),
 		oldConns:     make(chan *conn),
 		newBlocks:    make(chan *block, sc.NumBlocks),
 		currentConns: map[*conn]bool{},
@@ -140,7 +143,6 @@ func (s *socket) getNewBlocks() {
 		}
 		b.ref()
 		vlog.V(3, "%v got new block %v", s, b)
-        // TODO: maybe split the block based on flow?
 		s.newBlocks <- b
 		blockIndex = (blockIndex + 1) % s.conf.NumBlocks
 	}
@@ -191,7 +193,7 @@ func (s *socket) run() {
 			s.addNewConn(c)
 		case c := <-s.oldConns:
 			// unregister an old client connection and close its blocks
-			close(c.newBlocks)
+            //TODO: close(c.newBlocks)
 			delete(s.currentConns, c)
 		case b := <-s.newBlocks:
 			// a new block is avaiable, send it out to all clients
@@ -203,7 +205,7 @@ func (s *socket) run() {
                 if s.balance(c.lbIndex) {
                     b.ref()
                     select {
-                    case c.newBlocks <- b:
+                    case c.newPackets <- PacketRef { b, 0 }:
                     default:
                         vlog.V(1, "failed to send %v to %v", b, c)
                         b.unref()
@@ -221,7 +223,7 @@ type conn struct {
 	s         *socket
 	c         *net.UnixConn
     lbIndex   int
-	newBlocks chan *block
+    newPackets chan PacketRef
 	oldBlocks chan int
 }
 
@@ -292,21 +294,27 @@ func (c *conn) run() {
 loop:
 	for {
 		select {
-		case b := <-c.newBlocks:
+		case pkt := <-c.newPackets:
 			out = out[:0]
-			vlog.V(2, "%v writing %v", c, b)
+			vlog.V(2, "%v writing %v", c, pkt.b)
 		blockLoop:
 			for {
-				if !outstanding[b.index].IsZero() {
-					log.Fatalf("%v received already outstanding block %v", c, b)
+				if !outstanding[pkt.b.index].IsZero() {
+					log.Fatalf("%v received already outstanding block %v", c, pkt.b)
 				}
-				outstanding[b.index] = time.Now()
-				idx := len(out)
+				outstanding[pkt.b.index] = time.Now()
+
+                idx := len(out)
 				out = append(out, 0, 0, 0, 0)
-				binary.BigEndian.PutUint32(out[idx:], uint32(b.index))
+				binary.BigEndian.PutUint32(out[idx:], uint32(pkt.b.index))
+
+                idx = len(out)
+				out = append(out, 0, 0, 0, 0)
+				binary.BigEndian.PutUint32(out[idx:], uint32(pkt.off))
+
 				select {
-				case b = <-c.newBlocks:
-					vlog.V(2, "%v batching %v", c, b)
+				case pkt = <-c.newPackets:
+					vlog.V(2, "%v batching %v", c, pkt)
 				default:
 					break blockLoop
 				}
@@ -338,9 +346,9 @@ loop:
 	vlog.V(3, "%v marking self old", c)
 	c.s.oldConns <- c
 	vlog.V(3, "%v waiting for reads", c)
-	for b := range c.newBlocks {
-		vlog.V(3, "%v returning unsent %v", c, b)
-		b.unref()
+	for pkt := range c.newPackets {
+		vlog.V(3, "%v returning unsent %v", c, pkt.b)
+		pkt.b.unref()
 	}
 	// empty out oldBlocks to allow handleReads to finish, but don't do anything
 	// with them.  the next loop (over outstanding) will unref and return all
@@ -364,7 +372,7 @@ func (s *socket) addNewConn(c IncomingConnection) {
 		s:         s,
 		c:         c.unixConn,
         lbIndex:   c.lbIndex,
-		newBlocks: make(chan *block, len(s.blocks)),
+		newPackets: make(chan PacketRef, len(s.blocks)),
 		oldBlocks: make(chan int, len(s.blocks)),
 	}
 	log.Printf("%v new connection %v", s, newConn)

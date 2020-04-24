@@ -83,6 +83,13 @@ static void set_be_32(uint8_t* a, uint32_t x) {
     errno = errno_val;                                              \
     TERR(msg, ##__VA_ARGS__);                                       \
   } while (0)
+
+static ssize_t recv_wrap(int fd, void *buf, size_t len, int flags) {
+    ssize_t res = recv(fd, buf, len, flags);
+    printf("RECV\n");
+    return res;
+}
+
 static int recv_t(testimony t, uint8_t* out, size_t s) {
   int r;
   uint8_t* out_limit = out + s;
@@ -91,7 +98,7 @@ static int recv_t(testimony t, uint8_t* out, size_t s) {
     while (t->buf_start >= t->buf_limit) {
       t->buf_start = t->buf;
       t->buf_limit = t->buf;
-      r = recv(t->sock_fd, t->buf_start, TESTIMONY_BUF_SIZE, 0);
+      r = recv_wrap(t->sock_fd, t->buf_start, TESTIMONY_BUF_SIZE, 0);
       if (r == 0) {
         errno = ECANCELED;
         return -1;
@@ -166,6 +173,7 @@ static int recv_file_descriptor(int socket) {
   if (r != sizeof(data)) {
     return -1;
   }
+  printf("RECVMSG\n");
 
   /* Iterate through header to find if there is a file descriptor */
   for (control_message = CMSG_FIRSTHDR(&message); control_message != NULL;
@@ -352,6 +360,7 @@ int testimony_get_block(testimony t, int timeout_millis,
   // something about that.
   struct pollfd pfd;
   uint32_t blockidx, old_count;
+  uint32_t pkt_index;
   int r;
   uint32_t typ;
   *block = NULL;
@@ -375,6 +384,7 @@ int testimony_get_block(testimony t, int timeout_millis,
       }
       // A read is ready, fall through.
     }
+
     r = recv_be_32(t, &blockidx);
     if (r < 0) {
       TERR("recv of block index failed");
@@ -382,6 +392,12 @@ int testimony_get_block(testimony t, int timeout_millis,
     }
     typ = protocol_type(blockidx);
     if (typ == TESTIMONY_PROTOCOL_TYPE_BlockIndex) {
+      r = recv_be_32(t, &pkt_index);
+      if (r < 0) {
+        TERR("recv of packet index failed");
+        return -errno;
+      }
+      printf("pkt_index = %04x\n", pkt_index);
       break;
     }
     r = discard_bytes(t, protocol_length(blockidx));
