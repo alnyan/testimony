@@ -43,6 +43,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -119,14 +120,16 @@ func (s *socket) String() string {
 
 // getNewBlocks is a goroutine that watches for new available packet blocks,
 // which the run() method passes to clients.
-func (s *socket) getNewBlocks() {
+func (s *socket) getNewBlocks() error {
 	blockIndex := 0
 	for {
 		b := s.blocks[blockIndex]
 		for !b.ready() {
-			if C.WaitForBlocks(C.int(s.fd)) < 0 {
-				log.Printf("C WaitForBlocks failed")
-				return
+			if err := C.WaitForBlocks(C.int(s.fd)); err < 0 {
+				errno := syscall.Errno(-err)
+				res := fmt.Errorf("C WaitForBlocks failed: %s", errno.Error())
+				log.Print(res)
+				return res
 			}
 		}
 		b.ref()
@@ -134,6 +137,7 @@ func (s *socket) getNewBlocks() {
 		s.newBlocks <- b
 		blockIndex = (blockIndex + 1) % s.conf.NumBlocks
 	}
+	return nil
 }
 
 func (s *socket) reportStats() {

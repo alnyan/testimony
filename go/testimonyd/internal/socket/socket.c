@@ -28,6 +28,8 @@
 #define UNIX_PATH_MAX 108
 #endif
 
+// Blocks until a block is ready from AF_PACKET socket.
+// Returns 1 if ready, 0 on timeout, -errno on failure.
 int WaitForBlocks(int sock_fd) {
   struct timeval tv;
   fd_set fds;
@@ -36,11 +38,11 @@ int WaitForBlocks(int sock_fd) {
   FD_ZERO(&fds);
   FD_SET(sock_fd, &fds);
 
-  tv.tv_sec = 0;
-  tv.tv_usec = 10000;
+  tv.tv_sec = 1;
+  tv.tv_usec = 0;
 
   if ((res = select(sock_fd + 1, &fds, NULL, NULL, &tv)) < 0) {
-    return -1;
+    return -errno;
   }
 
   return res;
